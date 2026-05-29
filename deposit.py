@@ -7,12 +7,12 @@ import os
 import time
 import random
 import threading
-from typing import Dict, Optional
+from datetime import datetime, timedelta
 from telebot import TeleBot
 from database import (
-    get_balance, update_balance, add_transaction,
-    save_deposit, is_txid_processed, mark_txid_processed,
-    get_user
+    update_balance_atomic, add_transaction, save_deposit,
+    is_txid_processed, mark_txid_processed, get_user,
+    get_user_language
 )
 from tron import (
     get_recent_trc20_transactions,
@@ -20,202 +20,180 @@ from tron import (
     sun_to_usdt,
     WALLET_ADDRESS,
 )
+from i18n import get_text
 
 NETWORK_FEE = float(os.getenv("NETWORK_FEE", "1.0"))
-MIN_DEPOSIT  = float(os.getenv("MIN_DEPOSIT", "1.0"))
-
-# قاموس: pending_deposits[telegram_id] = timestamp (وقت بدء انتظار الإيداع)
-pending_deposits = {}  # type: Dict[int, float]
+MIN_DEPOSIT = float(os.getenv("MIN_DEPOSIT", "1.0"))
 DEPOSIT_TIMEOUT = 30 * 60  # 30 دقيقة
+AMOUNT_TOLERANCE = 0.001
 
-# ✅ جديد: قاموس يخزن المبلغ الفريد المتوقع لكل مستخدم
-# pending_deposit_amounts[telegram_id] = expected_amount (float)
-pending_deposit_amounts = {}  # type: Dict[int, float]
-
-# ✅ جديد: هامش التطابق للمبالغ (للتعامل مع فروق الدقة في الأرقام العشرية)
-AMOUNT_MATCH_TOLERANCE = 0.001
-
-
-def register_pending_deposit(telegram_id):
-    # type: (int) -> None
-    """تسجيل المستخدم في قائمة انتظار الإيداع"""
-    pending_deposits[telegram_id] = time.time()
-
-
-def cancel_pending_deposit(telegram_id):
-    # type: (int) -> None
-    """إلغاء انتظار إيداع مستخدم"""
-    pending_deposits.pop(telegram_id, None)
-    # ✅ جديد: تنظيف المبلغ المتوقع أيضاً
-    pending_deposit_amounts.pop(telegram_id, None)
-
+# قواميس الانتظار
+pending_deposits = {}        # {user_id: timestamp}
+pending_deposit_amounts = {} # {user_id: unique_amount}
 
 def get_deposit_address():
-    # type: () -> str
-    """إرجاع عنوان المحفظة الرئيسية للإيداع"""
+    """إرجاع عنوان المحفظة للإيداع"""
     return WALLET_ADDRESS
 
+def register_pending_deposit(user_id):
+    """تسجيل المستخدم في قائمة الانتظار"""
+    pending_deposits[user_id] = time.time()
 
-# ✅ دالة جديدة: توليد مبلغ فريد وتسجيله
-def generate_unique_deposit_amount(telegram_id, base_amount):
-    # type: (int, float) -> float
+def cancel_pending_deposit(user_id):
+    """إلغاء انتظار الإيداع"""
+    pending_deposits.pop(user_id, None)
+    pending_deposit_amounts.pop(user_id, None)
+
+def generate_unique_deposit_amount(user_id, base_amount):
     """
-    يُضيف رقماً عشوائياً صغيراً بين 0.01 و 0.5 على المبلغ الأساسي.
-    يتحقق أن المبلغ الناتج غير مستخدم من مستخدم آخر حالياً.
-    يعيد المبلغ الفريد ويحفظه.
+    توليد مبلغ فريد
+    يُضيف رقماً عشوائياً صغيراً على المبلغ الأساسي (0.01 - 0.99)
+    للتمكن من ربط الإيداع تلقائياً بالمستخدم
     """
     max_attempts = 20
     for _ in range(max_attempts):
-        # رقم عشوائي بين 0.01 و 0.50 بدقة سنتين
         random_addon = round(random.uniform(0.01, 0.50), 2)
         unique_amount = round(base_amount + random_addon, 2)
-
-        # تحقق أن هذا المبلغ غير مستخدم من مستخدم آخر ينتظر حالياً
+        
+        # تحقق أن المبلغ غير مستخدم من مستخدم آخر
         already_used = any(
-            uid != telegram_id and abs(amt - unique_amount) <= AMOUNT_MATCH_TOLERANCE
+            uid != user_id and abs(amt - unique_amount) <= AMOUNT_TOLERANCE
             for uid, amt in pending_deposit_amounts.items()
         )
-
+        
         if not already_used:
-            pending_deposit_amounts[telegram_id] = unique_amount
+            pending_deposit_amounts[user_id] = unique_amount
             return unique_amount
-
-    # في الحالة النادرة جداً: زد النطاق قليلاً
+    
+    # احتياط: نطاق أوسع
     fallback = round(base_amount + random.uniform(0.51, 0.99), 2)
-    pending_deposit_amounts[telegram_id] = fallback
+    pending_deposit_amounts[user_id] = fallback
     return fallback
 
-
 def start_deposit_monitor(bot):
-    # type: (TeleBot) -> None
-    """
-    تشغيل مراقب البلوكتشين في خيط منفصل.
-    يفحص كل 30 ثانية المعاملات الواردة الجديدة.
-    """
+    """تشغيل مراقب الإيداع في خيط منفصل"""
     def _monitor():
         print("[DEPOSIT] ✅ مراقب الإيداع يعمل...")
         while True:
             try:
                 _check_new_deposits(bot)
+                _cleanup_expired_deposits(bot)
             except Exception as e:
-                print(f"[DEPOSIT] خطأ في المراقب: {e}")
+                print(f"[DEPOSIT] خطأ: {e}")
             time.sleep(30)
-
+    
     t = threading.Thread(target=_monitor, daemon=True)
     t.start()
 
-
 def _check_new_deposits(bot):
-    # type: (TeleBot) -> None
-    """فحص المعاملات الواردة الجديدة وتحديث الأرصدة"""
+    """فحص المعاملات الواردة الجديدة"""
     if not pending_deposits:
-        return  # لا يوجد مستخدمون ينتظرون - وفّر API calls
-
+        return
+    
     txs = get_recent_trc20_transactions(WALLET_ADDRESS, limit=20)
-
+    
     for tx in txs:
         txid = tx.get("transaction_id", "")
         if not txid:
             continue
-
+        
         # تجاهل المعاملات المعالجة مسبقاً
         if is_txid_processed(txid):
             continue
-
-        # تحقق من التأكيد على البلوكتشين
+        
+        # تحقق من التأكيد
         if not verify_transaction_confirmed(txid):
             continue
-
-        # استخرج بيانات المعاملة
+        
+        # تحقق من العملة
         token_info = tx.get("token_info", {})
         if token_info.get("symbol", "") != "USDT":
             continue
-
+        
+        # احسب المبلغ
         raw_value = int(tx.get("value", "0"))
         amount_usdt = sun_to_usdt(raw_value)
-
+        
         if amount_usdt < MIN_DEPOSIT:
-            continue  # مبلغ أقل من الحد الأدنى
-
-        from_address = tx.get("from", "")
-        to_address   = tx.get("to", "")
-        block_ts     = tx.get("block_timestamp", 0) / 1000  # ms → s
-
-        # تحقق أن الوجهة هي محفظتنا
+            continue
+        
+        # تحقق من الوجهة
+        to_address = tx.get("to", "")
         if to_address != WALLET_ADDRESS:
             continue
-
-        # سجّل المعاملة كمعالجة فوراً (لمنع التكرار)
+        
+        # استخرج المعلومات
+        from_address = tx.get("from", "")
+        block_ts = tx.get("block_timestamp", 0) / 1000
+        
+        # سجّل TXID كمعالج فوراً (منع التكرار)
         mark_txid_processed(txid)
-
-        # ✅ معدّلة: المطابقة الآن تعتمد على المبلغ الفريد أولاً
+        
+        # طابق بالمستخدم
         matched_user = _match_deposit_to_user(from_address, amount_usdt, block_ts)
-
+        
         if matched_user:
-            # ✅ يُضاف المبلغ الكامل الذي أرسله المستخدم (بما في الرقم العشوائي)
             _credit_deposit(bot, matched_user, amount_usdt, txid, from_address)
         else:
-            # إيداع غير مرتبط بمستخدم - سجّله وأخطر الأدمن
-            print(f"[DEPOSIT] ⚠️ إيداع غير معروف: {txid} من {from_address} بمبلغ {amount_usdt}")
+            print(f"[DEPOSIT] ⚠️ إيداع غير معروف: {txid} من {from_address} بـ {amount_usdt}")
             _notify_admin_unknown_deposit(bot, txid, from_address, amount_usdt)
 
+def _cleanup_expired_deposits(bot):
+    """تنظيف الإيداعات المنتهية مع إشعار المستخدم"""
+    now = time.time()
+    expired = [
+        uid for uid, ts in list(pending_deposits.items())
+        if now - ts > DEPOSIT_TIMEOUT
+    ]
+    
+    for uid in expired:
+        pending_deposits.pop(uid, None)
+        expected = pending_deposit_amounts.pop(uid, None)
+        
+        try:
+            lang = get_user_language(uid)
+            msg = get_text(lang, "deposit_timeout", amt=expected or 0)
+            bot.send_message(uid, msg, parse_mode="Markdown")
+        except Exception as e:
+            print(f"[DEPOSIT] لم أستطع إرسال إشعار لـ {uid}: {e}")
 
 def _match_deposit_to_user(from_address, amount, block_ts):
-    # type: (str, float, float) -> Optional[int]
-    """
-    ✅ معدّلة: مطابقة الإيداع بالمبلغ الفريد أولاً.
-    إذا تطابق مبلغ مع مستخدم بهامش 0.001 → ربط مباشر.
-    إذا لم يوجد تطابق بالمبلغ → FIFO كاحتياط.
-    """
+    """مطابقة الإيداع بالمبلغ الفريد"""
     now = time.time()
-    # تنظيف المستخدمين منتهي المهلة
+    
+    # تنظيف منتهي الصلاحية
     expired = [uid for uid, ts in pending_deposits.items() if now - ts > DEPOSIT_TIMEOUT]
     for uid in expired:
         pending_deposits.pop(uid, None)
         pending_deposit_amounts.pop(uid, None)
-
+    
     if not pending_deposits:
         return None
-
-    # ✅ أولاً: ابحث عن تطابق بالمبلغ الفريد
+    
+    # ابحث عن تطابق بالمبلغ الفريد
     for uid, expected_amount in pending_deposit_amounts.items():
         if uid not in pending_deposits:
             continue
-        if abs(amount - expected_amount) <= AMOUNT_MATCH_TOLERANCE:
+        if abs(amount - expected_amount) <= AMOUNT_TOLERANCE:
             return uid
-
-    # ✅ ثانياً: إذا لم يوجد تطابق بالمبلغ (مستخدم أرسل بدون طلب مبلغ)
-    # إذا كان هناك مستخدم واحد فقط ينتظر بدون مبلغ محدد: افترض أنه صاحبه
-    pending_without_amount = [
-        uid for uid in pending_deposits
-        if uid not in pending_deposit_amounts
-    ]
-    if len(pending_without_amount) == 1:
-        return pending_without_amount[0]
-
-    # إذا كان هناك أكثر من مستخدم بدون مبلغ: خذ الأقدم (FIFO)
-    if pending_without_amount:
-        oldest = min(pending_without_amount, key=lambda uid: pending_deposits[uid])
-        return oldest
-
-    # لم يُوجد تطابق
+    
     return None
 
-
-def _credit_deposit(bot, telegram_id, amount, txid, from_address):
-    # type: (TeleBot, int, float, str, str) -> None
-    """إضافة الرصيد للمستخدم وإشعاره"""
+def _credit_deposit(bot, user_id, amount, txid, from_address):
+    """إضافة الرصيد للمستخدم"""
     # تأكد أن المستخدم مسجل
-    if not get_user(telegram_id):
+    if not get_user(user_id):
         return
-
-    # أضف الرصيد (المبلغ الكامل بما في الرقم العشوائي)
-    update_balance(telegram_id, amount)
-
-    # سجّل في قاعدة البيانات
-    save_deposit(telegram_id, txid, amount, from_address)
+    
+    # أضف الرصيد (ذري وآمن)
+    if not update_balance_atomic(user_id, amount, min_balance=0):
+        print(f"[DEPOSIT] ❌ فشل إضافة الرصيد لـ {user_id}")
+        return
+    
+    # سجّل في DB
+    save_deposit(user_id, txid, amount, from_address)
     add_transaction(
-        user_id=telegram_id,
+        user_id=user_id,
         tx_type="إيداع",
         amount=amount,
         status="مكتمل",
@@ -224,33 +202,28 @@ def _credit_deposit(bot, telegram_id, amount, txid, from_address):
         transaction_type="deposit",
         transaction_status="completed",
     )
-
-    # أزل من قائمة الانتظار (يشمل المبلغ المتوقع)
-    cancel_pending_deposit(telegram_id)
-
-    new_balance = get_balance(telegram_id)
-
+    
+    # أزل من الانتظار
+    cancel_pending_deposit(user_id)
+    
+    # إرسال إشعار
     try:
-        bot.send_message(
-            telegram_id,
-            f"✅ *تم استلام إيداعك!*\n\n"
-            f"💰 المبلغ المُضاف: `{amount:.4f} USDT`\n"
-            f"💳 رصيدك الجديد: `{new_balance:.4f} USDT`\n"
-            f"🔗 TXID: `{txid}`\n\n"
-            f"شكراً لاستخدامك خدمتنا! 🎉",
-            parse_mode="Markdown"
-        )
+        lang = get_user_language(user_id)
+        from database import get_balance
+        bal = get_balance(user_id)
+        msg = get_text(lang, "deposit_success", amt=amount, bal=bal, txid=txid)
+        bot.send_message(user_id, msg, parse_mode="Markdown")
     except Exception as e:
-        print(f"[DEPOSIT] لم أستطع إرسال إشعار للمستخدم {telegram_id}: {e}")
-
-    # أخطر الأدمن
+        print(f"[DEPOSIT] لم أستطع إرسال إشعار: {e}")
+    
+    # إخطار الأدمن
     admin_id = int(os.getenv("ADMIN_ID", "0"))
     if admin_id:
         try:
             bot.send_message(
                 admin_id,
                 f"✅ *إيداع مكتمل*\n"
-                f"👤 المستخدم: `{telegram_id}`\n"
+                f"👤 المستخدم: `{user_id}`\n"
                 f"💰 المبلغ: `{amount:.4f} USDT`\n"
                 f"🔗 TXID: `{txid}`",
                 parse_mode="Markdown"
@@ -258,10 +231,8 @@ def _credit_deposit(bot, telegram_id, amount, txid, from_address):
         except Exception:
             pass
 
-
 def _notify_admin_unknown_deposit(bot, txid, from_address, amount):
-    # type: (TeleBot, str, str, float) -> None
-    """إشعار الأدمن بإيداع غير مرتبط بمستخدم"""
+    """إشعار الأدمن بإيداع غير معروف"""
     admin_id = int(os.getenv("ADMIN_ID", "0"))
     if not admin_id:
         return

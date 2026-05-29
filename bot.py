@@ -1,12 +1,14 @@
 """
-bot.py - البوت الرئيسي
-محفظة USDT TRC20 مباشرة عبر شبكة TRON بدون أي وسيط
+bot.py - البوت الرئيسي الكامل
+محفظة USDT TRC20 آمنة واحترافية
 """
 
 import os
+import random
+import string
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-# تحميل متغيرات البيئة أولاً
 load_dotenv()
 
 import telebot
@@ -14,577 +16,643 @@ from telebot import types
 
 from database import (
     init_db, add_user, get_user, get_balance,
-    update_balance, add_transaction, get_transactions,
-    is_banned, check_rate_limit, get_custom_buttons
+    update_balance_atomic, add_transaction, get_transactions,
+    is_banned, check_rate_limit, get_custom_buttons,
+    get_user_language, set_user_language, get_all_users,
+    get_all_social_links, save_pending_transfer, get_pending_transfer,
+    clear_pending_transfer
 )
 from deposit import (
     get_deposit_address, register_pending_deposit,
-    cancel_pending_deposit, start_deposit_monitor, NETWORK_FEE, MIN_DEPOSIT,
-    generate_unique_deposit_amount  # ✅ جديد: توليد مبلغ فريد
+    cancel_pending_deposit, start_deposit_monitor,
+    generate_unique_deposit_amount
 )
-from withdraw import validate_withdrawal, process_withdrawal, get_withdrawal_summary
+from withdraw import (
+    validate_withdrawal, create_pending_withdrawal,
+    get_pending_withdrawal_data, clear_pending_withdrawal_data,
+    process_withdrawal, get_withdrawal_summary
+)
 from tron import is_valid_tron_address
-from admin import register_admin_handlers, is_admin, admin_inline_menu
+from i18n import get_text
 
 # ==================== CONFIG ====================
-BOT_TOKEN   = os.getenv("BOT_TOKEN", "")
-ADMIN_ID    = int(os.getenv("ADMIN_ID", "0"))
-COMMISSION  = float(os.getenv("COMMISSION", "0.2"))
-NETWORK_FEE_VAL = float(os.getenv("NETWORK_FEE", "1.0"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+COMMISSION = float(os.getenv("COMMISSION", "0.2"))
+MIN_WITHDRAW = float(os.getenv("MIN_WITHDRAW", "2.0"))
+MIN_DEPOSIT = float(os.getenv("MIN_DEPOSIT", "1.0"))
 
 if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN غير محدد في .env")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 init_db()
-
+start_deposit_monitor(bot)
 
 # ==================== MENUS ====================
 
-def main_menu() -> types.ReplyKeyboardMarkup:
+def main_menu(lang) -> types.ReplyKeyboardMarkup:
+    """القائمة الرئيسية"""
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add(
-        types.KeyboardButton("💼 المحفظة"),
-        types.KeyboardButton("👤 حسابي"),
-        types.KeyboardButton("⚙️ الإعدادات"),
+        types.KeyboardButton(get_text(lang, "btn_wallet")),
+        types.KeyboardButton(get_text(lang, "btn_profile"))
     )
+    markup.add(
+        types.KeyboardButton(get_text(lang, "btn_support")),
+        types.KeyboardButton(get_text(lang, "btn_settings"))
+    )
+    markup.add(types.KeyboardButton(get_text(lang, "btn_follow")))
+    
+    # أزرار مخصصة
     for btn in get_custom_buttons():
-        markup.add(types.KeyboardButton(btn["name"]))
+        markup.add(types.KeyboardButton(btn[1]))
+    
     return markup
 
-
-def wallet_menu() -> types.ReplyKeyboardMarkup:
+def wallet_menu(lang) -> types.ReplyKeyboardMarkup:
+    """قائمة المحفظة"""
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add(
-        types.KeyboardButton("📥 إيداع"),
-        types.KeyboardButton("📤 سحب"),
-        types.KeyboardButton("💰 الرصيد"),
-        types.KeyboardButton("🔄 تحويل داخلي"),
-        types.KeyboardButton("📜 سجل المعاملات"),
-        types.KeyboardButton("↩️ رجوع"),
+        types.KeyboardButton(get_text(lang, "btn_deposit")),
+        types.KeyboardButton(get_text(lang, "btn_withdraw"))
+    )
+    markup.add(
+        types.KeyboardButton(get_text(lang, "btn_balance")),
+        types.KeyboardButton(get_text(lang, "btn_transfer"))
+    )
+    markup.add(
+        types.KeyboardButton(get_text(lang, "btn_history")),
+        types.KeyboardButton(get_text(lang, "btn_back"))
     )
     return markup
 
+def settings_menu(lang) -> types.InlineKeyboardMarkup:
+    """قائمة الإعدادات"""
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(get_text(lang, "btn_language"), callback_data="settings_lang"))
+    return markup
 
-MENU_BUTTONS = {
-    "📥 إيداع", "📤 سحب", "💰 الرصيد", "↩️ رجوع",
-    "💼 المحفظة", "👤 حسابي", "⚙️ الإعدادات",
-    "📜 سجل المعاملات", "🔄 تحويل داخلي",
-}
+def languages_menu(lang) -> types.InlineKeyboardMarkup:
+    """قائمة اللغات"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton(get_text(lang, "lang_ar"), callback_data="lang_ar"),
+        types.InlineKeyboardButton(get_text(lang, "lang_en"), callback_data="lang_en")
+    )
+    markup.add(
+        types.InlineKeyboardButton(get_text(lang, "lang_fr"), callback_data="lang_fr"),
+        types.InlineKeyboardButton(get_text(lang, "lang_de"), callback_data="lang_de")
+    )
+    markup.add(
+        types.InlineKeyboardButton(get_text(lang, "lang_es"), callback_data="lang_es"),
+        types.InlineKeyboardButton(get_text(lang, "lang_hi"), callback_data="lang_hi")
+    )
+    markup.add(types.InlineKeyboardButton(get_text(lang, "lang_zh"), callback_data="lang_zh"))
+    return markup
 
+def follow_menu(lang) -> types.InlineKeyboardMarkup:
+    """قائمة المتابعة"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    links = get_all_social_links()
+    for platform, url in links:
+        if url:
+            display_name = platform.upper()
+            markup.add(types.InlineKeyboardButton(display_name, url=url))
+    return markup
 
 def guard(msg) -> bool:
-    """حماية مشتركة: تحقق من الحظر + rate limit"""
-    if is_banned(msg.from_user.id):
-        bot.send_message(msg.chat.id, "❌ حسابك محظور. تواصل مع الدعم.")
+    """حماية مشتركة"""
+    uid = msg.from_user.id
+    lang = get_user_language(uid)
+    
+    if is_banned(uid):
+        bot.send_message(msg.chat.id, get_text(lang, "error_banned"))
         return False
-    if not check_rate_limit(msg.from_user.id):
-        bot.send_message(msg.chat.id, "⚠️ لا تضغط بسرعة! انتظر لحظة.")
+    
+    if not check_rate_limit(uid):
+        bot.send_message(msg.chat.id, get_text(lang, "error_rate_limit"))
         return False
+    
     return True
-
 
 # ==================== START ====================
 
 @bot.message_handler(commands=["start"])
 def start(msg):
+    uid = msg.from_user.id
+    add_user(uid, msg.from_user.username)
+    
     if not guard(msg):
         return
-    add_user(msg.from_user.id, msg.from_user.username)
-
-    if is_admin(msg.from_user.id):
+    
+    lang = get_user_language(uid)
+    
+    # أدمن
+    if uid == ADMIN_ID:
+        from admin import admin_inline_menu
         bot.send_message(
             msg.chat.id,
-            f"👑 *مرحباً أدمن!*\n\nاختر من لوحة التحكم:",
-            parse_mode="Markdown",
+            "👑 لوحة الأدمن",
             reply_markup=admin_inline_menu()
         )
         return
-
-    bot.send_message(
-        msg.chat.id,
-        f"👋 أهلاً *{msg.from_user.first_name}*!\n\n"
-        f"🏦 مرحباً في محفظتك الإلكترونية\n"
-        f"💎 العملة: USDT (TRC20)\n"
-        f"🌐 الشبكة: TRON مباشر\n"
-        f"🔒 عمليات آمنة ومباشرة على البلوكتشين\n\n"
-        f"اختر من القائمة:",
-        parse_mode="Markdown",
-        reply_markup=main_menu()
-    )
-
+    
+    # مستخدم عادي
+    welcome_msg = get_text(lang, "welcome", name=msg.from_user.first_name)
+    bot.send_message(msg.chat.id, welcome_msg, parse_mode="Markdown", reply_markup=main_menu(lang))
 
 # ==================== WALLET ====================
 
-@bot.message_handler(func=lambda m: m.text == "💼 المحفظة")
+@bot.message_handler(func=lambda m: m.text and m.text.startswith("💼"))
 def wallet(msg):
     if not guard(msg):
         return
-    bal = get_balance(msg.from_user.id)
-    bot.send_message(
-        msg.chat.id,
-        f"💼 *المحفظة*\n\n💰 رصيدك: *{bal:.4f} USDT*",
-        parse_mode="Markdown",
-        reply_markup=wallet_menu()
-    )
+    
+    uid = msg.from_user.id
+    lang = get_user_language(uid)
+    bal = get_balance(uid)
+    
+    text = f"{get_text(lang, 'wallet_title')}\n\n💰 `{bal:.4f} USDT`"
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown", reply_markup=wallet_menu(lang))
 
-
-@bot.message_handler(func=lambda m: m.text == "💰 الرصيد")
+@bot.message_handler(func=lambda m: m.text and m.text.startswith("💰"))
 def balance(msg):
-    if is_banned(msg.from_user.id):
+    uid = msg.from_user.id
+    lang = get_user_language(uid)
+    
+    if is_banned(uid):
         return
-    bal = get_balance(msg.from_user.id)
-    bot.send_message(
-        msg.chat.id,
-        f"💰 *رصيدك الحالي*\n\n`{bal:.4f} USDT`",
-        parse_mode="Markdown",
-        reply_markup=wallet_menu()
-    )
-
+    
+    bal = get_balance(uid)
+    text = f"{get_text(lang, 'balance_title')}\n\n`{bal:.4f} USDT`"
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown")
 
 # ==================== DEPOSIT ====================
 
-@bot.message_handler(func=lambda m: m.text == "📥 إيداع")
+@bot.message_handler(func=lambda m: m.text and m.text.startswith("📥"))
 def deposit(msg):
     if not guard(msg):
         return
-
-    address = get_deposit_address()
-    if not address:
-        bot.send_message(msg.chat.id, "❌ خطأ في إعدادات المحفظة. تواصل مع الدعم.")
+    
+    uid = msg.from_user.id
+    lang = get_user_language(uid)
+    addr = get_deposit_address()
+    
+    if not addr:
+        bot.send_message(msg.chat.id, "❌ خطأ في الإعدادات")
         return
+    
+    text = get_text(lang, "deposit_amount_req", min_dep=MIN_DEPOSIT)
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown")
+    bot.register_next_step_handler(msg, lambda m: _handle_deposit_amount(m, addr, lang))
 
-    # ✅ جديد: اطلب المبلغ أولاً قبل عرض العنوان
-    bot.send_message(
-        msg.chat.id,
-        f"📥 *الإيداع عبر USDT TRC20*\n\n"
-        f"💸 الحد الأدنى للإيداع: `{MIN_DEPOSIT} USDT`\n\n"
-        f"أدخل المبلغ الذي تريد إيداعه:\n"
-        f"_(مثال: `10` أو `25.5`)_",
-        parse_mode="Markdown"
-    )
-    bot.register_next_step_handler(msg, lambda m: _get_deposit_amount(m, address))
-
-
-def _get_deposit_amount(msg, address: str):
-    """✅ جديد: استقبال مبلغ الإيداع وعرض المبلغ الفريد"""
-    if msg.text in MENU_BUTTONS or (msg.text and msg.text.startswith("/")):
+def _handle_deposit_amount(msg, addr, lang):
+    """معالجة مبلغ الإيداع"""
+    if msg.text in get_text(lang, "btn_back"):
         bot.process_new_messages([msg])
         return
-
+    
     try:
-        base_amount = float(msg.text.strip().replace(",", "."))
+        base_amt = float(msg.text.strip().replace(",", "."))
     except ValueError:
-        bot.send_message(
-            msg.chat.id,
-            "❌ أدخل رقماً صحيحاً مثل: `10` أو `25.5`",
-            parse_mode="Markdown"
-        )
-        bot.register_next_step_handler(msg, lambda m: _get_deposit_amount(m, address))
+        bot.send_message(msg.chat.id, get_text(lang, "error_invalid_amount"))
+        bot.register_next_step_handler(msg, lambda m: _handle_deposit_amount(m, addr, lang))
         return
-
-    if base_amount < MIN_DEPOSIT:
-        bot.send_message(
-            msg.chat.id,
-            f"❌ الحد الأدنى للإيداع هو `{MIN_DEPOSIT} USDT`\n\nأدخل مبلغاً أكبر:",
-            parse_mode="Markdown"
-        )
-        bot.register_next_step_handler(msg, lambda m: _get_deposit_amount(m, address))
+    
+    if base_amt < MIN_DEPOSIT:
+        bot.send_message(msg.chat.id, f"❌ الحد الأدنى: `{MIN_DEPOSIT} USDT`", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, lambda m: _handle_deposit_amount(m, addr, lang))
         return
-
-    # ✅ توليد مبلغ فريد وتسجيل المستخدم في قائمة الانتظار
-    unique_amount = generate_unique_deposit_amount(msg.from_user.id, base_amount)
-    register_pending_deposit(msg.from_user.id)
-
+    
+    uid = msg.from_user.id
+    unique_amt = generate_unique_deposit_amount(uid, base_amt)
+    register_pending_deposit(uid)
+    
+    text = get_text(lang, "deposit_address_show", addr=addr, amt=unique_amt)
+    
     markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton(
-            "✅ تم الإرسال - تحقق الآن",
-            callback_data=f"manual_check_{msg.from_user.id}"
-        )
-    )
+    markup.add(types.InlineKeyboardButton(get_text(lang, "btn_check"), callback_data=f"check_dep_{uid}"))
+    
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown", reply_markup=markup)
 
-    bot.send_message(
-        msg.chat.id,
-        f"📥 *الإيداع عبر USDT TRC20*\n\n"
-        f"📍 *عنوان المحفظة:*\n"
-        f"`{address}`\n\n"
-        f"💎 *المبلغ المطلوب إرساله بالضبط:*\n"
-        f"➡️ `{unique_amount:.2f} USDT`\n\n"
-        f"🌐 الشبكة: `TRON (TRC20)` فقط\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"⚠️ *مهم جداً:* أرسل المبلغ أعلاه *بالضبط* `{unique_amount:.2f}`\n"
-        f"هذا الرقم يُستخدم لربط إيداعك بحسابك تلقائياً ✅\n\n"
-        f"📌 سيُضاف *كامل المبلغ* `{unique_amount:.2f} USDT` لرصيدك\n"
-        f"⏱️ مدة التأكيد: ~1-3 دقائق\n\n"
-        f"⚠️ أرسل على شبكة TRON فقط!",
-        parse_mode="Markdown",
-        reply_markup=markup
-    )
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("manual_check_"))
-def manual_check_deposit(call):
-    user_id = int(call.data.split("_")[2])
-
-    if call.from_user.id != user_id:
+@bot.callback_query_handler(func=lambda c: c.data.startswith("check_dep_"))
+def check_deposit(call):
+    uid = int(call.data.split("_")[2])
+    
+    if call.from_user.id != uid:
         bot.answer_callback_query(call.id, "❌ هذا ليس طلبك!")
         return
-
-    bot.answer_callback_query(call.id, "⏳ جاري فحص البلوكتشين...")
-    bot.send_message(
-        call.message.chat.id,
-        "⏳ *جاري التحقق من البلوكتشين...*\n\n"
-        "النظام يراقب المعاملات تلقائياً كل 30 ثانية.\n"
-        "إذا أرسلت المبلغ، سيُضاف رصيدك تلقائياً خلال دقيقة إلى دقيقتين.\n\n"
-        "🔍 تأكد من أن:\n"
-        "• العنوان صحيح\n"
-        "• الشبكة TRC20\n"
-        "• المبلغ لا يقل عن 1 USDT",
-        parse_mode="Markdown"
-    )
-
+    
+    lang = get_user_language(uid)
+    bot.answer_callback_query(call.id, "✅ تم")
+    bot.send_message(call.message.chat.id, "⏳ النظام يراقب تلقائياً كل 30 ثانية.", parse_mode="Markdown")
 
 # ==================== WITHDRAW ====================
 
-@bot.message_handler(func=lambda m: m.text == "📤 سحب")
+@bot.message_handler(func=lambda m: m.text and m.text.startswith("📤"))
 def withdraw(msg):
     if not guard(msg):
         return
-
-    bal = get_balance(msg.from_user.id)
-    min_needed = float(os.getenv("MIN_WITHDRAW", "2.0")) + NETWORK_FEE_VAL
-
-    if bal < min_needed:
-        bot.send_message(
-            msg.chat.id,
-            f"❌ *رصيد غير كافٍ للسحب*\n\n"
-            f"رصيدك: `{bal:.4f} USDT`\n"
-            f"الحد الأدنى للسحب: `{float(os.getenv('MIN_WITHDRAW', '2.0')):.2f} USDT`\n"
-            f"رسوم الشبكة: `{NETWORK_FEE_VAL:.2f} USDT`\n"
-            f"إجمالي المطلوب: `{min_needed:.2f} USDT`",
-            parse_mode="Markdown",
-            reply_markup=wallet_menu()
-        )
+    
+    uid = msg.from_user.id
+    lang = get_user_language(uid)
+    bal = get_balance(uid)
+    fee = float(os.getenv("NETWORK_FEE", "1.0"))
+    
+    if bal < MIN_WITHDRAW + fee:
+        bot.send_message(msg.chat.id, f"❌ رصيد غير كافٍ. المطلوب: `{MIN_WITHDRAW + fee:.4f} USDT`", parse_mode="Markdown")
         return
+    
+    text = get_text(lang, "withdraw_address_req", bal=bal, fee=fee)
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown")
+    bot.register_next_step_handler(msg, _handle_withdraw_address)
 
-    bot.send_message(
-        msg.chat.id,
-        f"📤 *السحب عبر TRC20*\n\n"
-        f"💰 رصيدك: `{bal:.4f} USDT`\n"
-        f"🌐 رسوم الشبكة: `{NETWORK_FEE_VAL:.2f} USDT` (تُخصم منك)\n\n"
-        f"أرسل عنوان محفظتك TRC20:\n"
-        f"(عنوان يبدأ بـ T ويكون 34 حرفاً)",
-        parse_mode="Markdown",
-        reply_markup=wallet_menu()
-    )
-    bot.register_next_step_handler(msg, _get_withdraw_address)
-
-
-def _get_withdraw_address(msg):
-    if msg.text in MENU_BUTTONS or (msg.text and msg.text.startswith("/")):
-        bot.process_new_messages([msg])
+def _handle_withdraw_address(msg):
+    """معالجة عنوان السحب"""
+    lang = get_user_language(msg.from_user.id)
+    addr = msg.text.strip()
+    
+    if not is_valid_tron_address(addr):
+        bot.send_message(msg.chat.id, get_text(lang, "error_invalid_address"))
+        bot.register_next_step_handler(msg, _handle_withdraw_address)
         return
+    
+    bot.send_message(msg.chat.id, get_text(lang, "withdraw_amount_req", addr=addr), parse_mode="Markdown")
+    bot.register_next_step_handler(msg, lambda m: _handle_withdraw_amount(m, addr))
 
-    address = msg.text.strip()
-
-    if not is_valid_tron_address(address):
-        bot.send_message(
-            msg.chat.id,
-            "❌ عنوان TRC20 غير صحيح!\n"
-            "• يبدأ بحرف `T`\n"
-            "• طوله 34 حرفاً\n"
-            "• شبكة TRON فقط\n\n"
-            "أرسل العنوان مرة أخرى أو اضغط رجوع:",
-            parse_mode="Markdown",
-            reply_markup=wallet_menu()
-        )
-        return
-
-    bot.send_message(
-        msg.chat.id,
-        f"✅ العنوان صحيح: `{address}`\n\n"
-        f"الآن أدخل المبلغ بالـ USDT:\n"
-        f"(مثال: `10` أو `25.5`)",
-        parse_mode="Markdown"
-    )
-    bot.register_next_step_handler(msg, lambda m: _get_withdraw_amount(m, address))
-
-
-def _get_withdraw_amount(msg, address: str):
-    if msg.text in MENU_BUTTONS or (msg.text and msg.text.startswith("/")):
-        bot.process_new_messages([msg])
-        return
-
+def _handle_withdraw_amount(msg, addr):
+    """معالجة مبلغ السحب"""
+    lang = get_user_language(msg.from_user.id)
+    
     try:
-        amount = float(msg.text.strip())
+        amt = float(msg.text.strip())
     except ValueError:
-        bot.send_message(msg.chat.id, "❌ أدخل رقماً صحيحاً مثل: `10`",
-                         parse_mode="Markdown")
+        bot.send_message(msg.chat.id, get_text(lang, "error_invalid_amount"))
+        bot.register_next_step_handler(msg, lambda m: _handle_withdraw_amount(m, addr))
         return
-
-    ok, err_msg = validate_withdrawal(msg.from_user.id, address, amount)
+    
+    ok, err = validate_withdrawal(msg.from_user.id, addr, amt)
     if not ok:
-        bot.send_message(msg.chat.id, err_msg, parse_mode="Markdown",
-                         reply_markup=wallet_menu())
+        bot.send_message(msg.chat.id, err, parse_mode="Markdown")
+        bot.register_next_step_handler(msg, lambda m: _handle_withdraw_amount(m, addr))
         return
-
-    # عرض ملخص التأكيد
-    summary = get_withdrawal_summary(address, amount)
+    
+    create_pending_withdrawal(msg.from_user.id, addr, amt)
+    
+    summary = get_withdrawal_summary(addr, amt)
+    
     markup = types.InlineKeyboardMarkup()
     markup.add(
-        types.InlineKeyboardButton(
-            "✅ تأكيد السحب",
-            callback_data=f"confirm_wd|{address}|{amount}|{msg.from_user.id}"
-        ),
-        types.InlineKeyboardButton("❌ إلغاء", callback_data="cancel_wd")
+        types.InlineKeyboardButton(get_text(lang, "btn_confirm"), callback_data="confirm_wd"),
+        types.InlineKeyboardButton(get_text(lang, "btn_cancel"), callback_data="cancel_wd")
     )
+    
     bot.send_message(msg.chat.id, summary, parse_mode="Markdown", reply_markup=markup)
 
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("confirm_wd|"))
+@bot.callback_query_handler(func=lambda c: c.data == "confirm_wd")
 def confirm_withdraw(call):
-    parts = call.data.split("|")
-    address   = parts[1]
-    amount    = float(parts[2])
-    user_id   = int(parts[3])
-
-    if call.from_user.id != user_id:
-        bot.answer_callback_query(call.id, "❌ هذا ليس طلبك!")
+    uid = call.from_user.id
+    lang = get_user_language(uid)
+    
+    data = get_pending_withdrawal_data(uid)
+    if not data:
+        bot.answer_callback_query(call.id, "❌ انتهت الجلسة", show_alert=True)
         return
-
+    
+    addr, amt, _ = data
+    
     bot.answer_callback_query(call.id, "⏳ جاري المعالجة...")
-    bot.send_message(call.message.chat.id, "⏳ *جاري إرسال المبلغ على شبكة TRON...*",
-                     parse_mode="Markdown")
-
-    success, result_msg, txid = process_withdrawal(user_id, address, amount)
-
-    bot.send_message(
-        call.message.chat.id,
-        result_msg,
-        parse_mode="Markdown",
-        reply_markup=wallet_menu()
-    )
-
-    if success and txid:
-        # إشعار الأدمن
+    bot.send_message(call.message.chat.id, "⏳ جاري إرسال المبلغ...", parse_mode="Markdown")
+    
+    ok, result_msg, txid = process_withdrawal(uid, addr, amt)
+    
+    clear_pending_withdrawal_data(uid)
+    
+    bot.send_message(call.message.chat.id, result_msg, parse_mode="Markdown")
+    
+    # إخطار أدمن
+    if ok and txid and ADMIN_ID:
         try:
             bot.send_message(
                 ADMIN_ID,
                 f"📤 *سحب مكتمل*\n"
-                f"👤 المستخدم: `{user_id}`\n"
-                f"📍 العنوان: `{address}`\n"
-                f"💰 المبلغ: `{amount:.4f} USDT`\n"
-                f"🌐 رسوم الشبكة: `{NETWORK_FEE_VAL:.4f} USDT`\n"
+                f"👤 المستخدم: `{uid}`\n"
+                f"📍 العنوان: `{addr}`\n"
+                f"💰 المبلغ: `{amt:.4f} USDT`\n"
                 f"🔗 TXID: `{txid}`",
                 parse_mode="Markdown"
             )
         except Exception:
             pass
 
-
 @bot.callback_query_handler(func=lambda c: c.data == "cancel_wd")
 def cancel_withdraw(call):
+    lang = get_user_language(call.from_user.id)
+    clear_pending_withdrawal_data(call.from_user.id)
     bot.answer_callback_query(call.id, "❌ تم الإلغاء")
-    bot.send_message(call.message.chat.id, "❌ تم إلغاء عملية السحب",
-                     reply_markup=wallet_menu())
-
+    bot.send_message(call.message.chat.id, "❌ تم إلغاء عملية السحب")
 
 # ==================== TRANSFER ====================
 
-@bot.message_handler(func=lambda m: m.text == "🔄 تحويل داخلي")
-def internal_transfer(msg):
+@bot.message_handler(func=lambda m: m.text and m.text.startswith("🔄"))
+def transfer(msg):
     if not guard(msg):
         return
-    bal = get_balance(msg.from_user.id)
-    bot.send_message(
-        msg.chat.id,
-        f"🔄 *التحويل الداخلي*\n\n"
-        f"💰 رصيدك: `{bal:.4f} USDT`\n"
-        f"💸 العمولة: `{COMMISSION} USDT`\n\n"
-        f"أرسل: `ID_المستخدم المبلغ`\n"
-        f"مثال: `123456789 5`",
-        parse_mode="Markdown",
-        reply_markup=wallet_menu()
-    )
-    bot.register_next_step_handler(msg, _process_transfer)
+    
+    uid = msg.from_user.id
+    lang = get_user_language(uid)
+    bal = get_balance(uid)
+    
+    text = get_text(lang, "transfer_amount_req", bal=bal, comm=COMMISSION)
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown")
+    bot.register_next_step_handler(msg, _handle_transfer)
 
-
-def _process_transfer(msg):
-    if msg.text in MENU_BUTTONS or (msg.text and msg.text.startswith("/")):
-        bot.process_new_messages([msg])
-        return
-
+def _handle_transfer(msg):
+    """معالجة التحويل الداخلي"""
+    lang = get_user_language(msg.from_user.id)
+    
     try:
         parts = msg.text.strip().split()
-        to_id  = int(parts[0])
-        amount = float(parts[1])
+        to_id = int(parts[0])
+        amt = float(parts[1])
     except (ValueError, IndexError):
-        bot.send_message(msg.chat.id, "❌ الصيغة: `123456789 5`", parse_mode="Markdown")
+        bot.send_message(msg.chat.id, "❌ الصيغة: `ID المبلغ`\nمثال: `123456789 50`", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, _handle_transfer)
         return
-
-    from database import get_user as db_get_user
-    if to_id == msg.from_user.id:
-        bot.send_message(msg.chat.id, "❌ لا يمكنك التحويل لنفسك")
+    
+    uid = msg.from_user.id
+    
+    # فحوصات
+    if to_id == uid:
+        bot.send_message(msg.chat.id, get_text(lang, "error_self_transfer"))
         return
-
-    if not db_get_user(to_id):
-        bot.send_message(msg.chat.id, "❌ المستخدم غير موجود في النظام")
+    
+    receiver = get_user(to_id)
+    if not receiver:
+        bot.send_message(msg.chat.id, get_text(lang, "error_user_not_found"))
         return
-
+    
     if is_banned(to_id):
-        bot.send_message(msg.chat.id, "❌ المستخدم محظور")
+        bot.send_message(msg.chat.id, get_text(lang, "error_user_banned"))
         return
-
-    bal   = get_balance(msg.from_user.id)
-    total = amount + COMMISSION
-
+    
+    bal = get_balance(uid)
+    total = amt + COMMISSION
+    
     if total > bal:
-        bot.send_message(
-            msg.chat.id,
-            f"❌ رصيد غير كافٍ\n"
-            f"رصيدك: `{bal:.4f} USDT`\n"
-            f"المطلوب: `{total:.4f} USDT`",
-            parse_mode="Markdown"
-        )
+        bot.send_message(msg.chat.id, get_text(lang, "error_insufficient_balance"))
         return
-
-    update_balance(msg.from_user.id, -total)
-    update_balance(to_id, amount)
-    add_transaction(msg.from_user.id, "تحويل صادر", amount, "مكتمل",
-                    transaction_type="transfer_out", transaction_status="completed")
-    add_transaction(to_id, "تحويل وارد", amount, "مكتمل",
-                    transaction_type="transfer_in", transaction_status="completed")
-
-    new_bal = get_balance(msg.from_user.id)
-    bot.send_message(
-        msg.chat.id,
-        f"✅ *تم التحويل بنجاح!*\n\n"
-        f"📤 إلى: `{to_id}`\n"
-        f"💰 المبلغ: `{amount:.4f} USDT`\n"
-        f"💸 العمولة: `{COMMISSION} USDT`\n"
-        f"💳 رصيدك الجديد: `{new_bal:.4f} USDT`",
-        parse_mode="Markdown",
-        reply_markup=wallet_menu()
+    
+    # إنشاء معرّف عملية
+    ref = "TX-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    expires_at = (datetime.now() + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+    transfer_id = save_pending_transfer(uid, to_id, amt, COMMISSION, expires_at)
+    
+    receiver_name = receiver[2] or "مستخدم"
+    
+    text = get_text(lang, "transfer_confirm", name=receiver_name, uid=to_id, amt=amt, comm=COMMISSION, ref=ref)
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton(get_text(lang, "btn_confirm"), callback_data=f"conf_tr_{transfer_id}"),
+        types.InlineKeyboardButton(get_text(lang, "btn_cancel"), callback_data=f"canc_tr_{transfer_id}")
     )
+    
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown", reply_markup=markup)
 
+@bot.callback_query_handler(func=lambda c: c.data.startswith("conf_tr_"))
+def confirm_transfer(call):
     try:
-        bot.send_message(
-            to_id,
-            f"💸 *استلمت تحويل!*\n\n"
-            f"💰 المبلغ: `{amount:.4f} USDT`\n"
-            f"💳 رصيدك الجديد: `{get_balance(to_id):.4f} USDT`",
-            parse_mode="Markdown"
-        )
+        transfer_id = int(call.data.split("_")[2])
+    except (ValueError, IndexError):
+        bot.answer_callback_query(call.id, "❌ خطأ", show_alert=True)
+        return
+    
+    uid = call.from_user.id
+    lang = get_user_language(uid)
+    
+    data = get_pending_transfer(transfer_id)
+    if not data:
+        bot.answer_callback_query(call.id, "❌ انتهت الجلسة", show_alert=True)
+        return
+    
+    sender_id, receiver_id, amt, comm, expires_at = data
+    
+    # فحص الصلاحية
+    exp_time = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
+    if datetime.now() > exp_time:
+        clear_pending_transfer(transfer_id)
+        bot.answer_callback_query(call.id, "❌ انتهت صلاحية الجلسة", show_alert=True)
+        return
+    
+    # فحص أن الضاغط هو المرسل
+    if uid != sender_id:
+        bot.answer_callback_query(call.id, "❌ هذا ليس طلبك!", show_alert=True)
+        return
+    
+    # تنفيذ التحويل (ذري وآمن)
+    total = amt + comm
+    if not update_balance_atomic(sender_id, -total, min_balance=0):
+        bot.answer_callback_query(call.id, "❌ فشل الخصم", show_alert=True)
+        return
+    
+    update_balance_atomic(receiver_id, amt, min_balance=0)
+    
+    # تسجيل
+    add_transaction(sender_id, "تحويل صادر", amt, "مكتمل", transaction_type="transfer_out", transaction_status="completed")
+    add_transaction(receiver_id, "تحويل وارد", amt, "مكتمل", transaction_type="transfer_in", transaction_status="completed")
+    
+    clear_pending_transfer(transfer_id)
+    
+    # رسائل
+    receiver = get_user(receiver_id)
+    receiver_name = receiver[2] if receiver else "مستخدم"
+    
+    new_bal_sender = get_balance(sender_id)
+    msg_sender = get_text(lang, "transfer_success", uid=receiver_id, name=receiver_name, amt=amt, comm=comm, bal=new_bal_sender)
+    
+    bot.answer_callback_query(call.id, "✅ تم التحويل!")
+    bot.send_message(call.message.chat.id, msg_sender, parse_mode="Markdown")
+    
+    # إخطار المستقبل
+    try:
+        lang_receiver = get_user_language(receiver_id)
+        new_bal_receiver = get_balance(receiver_id)
+        msg_receiver = get_text(lang_receiver, "transfer_received", name=receiver_name, amt=amt, bal=new_bal_receiver)
+        bot.send_message(receiver_id, msg_receiver, parse_mode="Markdown")
     except Exception:
         pass
 
+@bot.callback_query_handler(func=lambda c: c.data.startswith("canc_tr_"))
+def cancel_transfer(call):
+    try:
+        transfer_id = int(call.data.split("_")[2])
+    except (ValueError, IndexError):
+        return
+    
+    uid = call.from_user.id
+    data = get_pending_transfer(transfer_id)
+    
+    if data and data[0] == uid:
+        clear_pending_transfer(transfer_id)
+        bot.answer_callback_query(call.id, "❌ تم الإلغاء")
+    else:
+        bot.answer_callback_query(call.id, "❌ خطأ", show_alert=True)
 
 # ==================== HISTORY ====================
 
-@bot.message_handler(func=lambda m: m.text == "📜 سجل المعاملات")
+@bot.message_handler(func=lambda m: m.text and m.text.startswith("📜"))
 def history(msg):
-    if is_banned(msg.from_user.id):
+    uid = msg.from_user.id
+    lang = get_user_language(uid)
+    
+    if is_banned(uid):
         return
-    txs = get_transactions(msg.from_user.id, limit=10)
+    
+    txs = get_transactions(uid, limit=10)
     if not txs:
-        bot.send_message(msg.chat.id, "📜 لا توجد معاملات بعد", reply_markup=wallet_menu())
+        bot.send_message(msg.chat.id, get_text(lang, "history_empty"))
         return
-
-    text = "📜 *آخر 10 معاملات:*\n\n"
+    
+    text = f"{get_text(lang, 'history_title')}\n\n"
     for tx in txs:
-        tx_type   = tx["type"]
-        amount    = tx["amount"]
-        status    = tx["status"]
-        txid      = tx["txid"] or "—"
-        net_fee   = tx["network_fee"] or 0
-        created   = tx["created_at"]
-
+        tx_type = tx[0]
+        amt = tx[1]
+        status = tx[2]
+        txid = tx[3] or "—"
+        
         emoji = "📥" if "إيداع" in tx_type or "وارد" in tx_type else "📤"
-        txid_short = txid[:16] + "..." if len(txid) > 16 else txid
-        fee_line = f"🌐 رسوم: `{net_fee:.4f}`\n" if net_fee > 0 else ""
+        txid_short = txid[:12] + "..." if len(txid) > 12 else txid
+        
+        text += f"{emoji} `{tx_type}`\n💰 `{amt:.4f} USDT` | {status}\n🔗 `{txid_short}`\n─────────────\n"
+    
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown")
 
-        text += (
-            f"{emoji} *{tx_type}*\n"
-            f"💰 `{amount:.4f} USDT` | {status}\n"
-            f"{fee_line}"
-            f"🔗 `{txid_short}`\n"
-            f"📅 {created}\n"
-            f"─────────────\n"
-        )
+# ==================== PROFILE ====================
 
-    bot.send_message(msg.chat.id, text, parse_mode="Markdown", reply_markup=wallet_menu())
-
-
-# ==================== ACCOUNT ====================
-
-@bot.message_handler(func=lambda m: m.text == "👤 حسابي")
-def account(msg):
-    if is_banned(msg.from_user.id):
+@bot.message_handler(func=lambda m: m.text and m.text.startswith("👤"))
+def profile(msg):
+    uid = msg.from_user.id
+    lang = get_user_language(uid)
+    
+    if is_banned(uid):
         return
-    user = get_user(msg.from_user.id)
-    bal  = get_balance(msg.from_user.id)
-    registered = user["created_at"] if user else "غير معروف"
-    bot.send_message(
-        msg.chat.id,
-        f"👤 *حسابي*\n\n"
-        f"الاسم: {msg.from_user.first_name}\n"
-        f"🆔 ID: `{msg.from_user.id}`\n"
-        f"💰 الرصيد: `{bal:.4f} USDT`\n"
-        f"📅 تاريخ التسجيل: `{registered}`\n\n"
-        f"🌐 الشبكة: TRON (TRC20)",
-        parse_mode="Markdown",
-        reply_markup=main_menu()
-    )
-
+    
+    user = get_user(uid)
+    bal = get_balance(uid)
+    
+    text = get_text(lang, "profile_info", name=msg.from_user.first_name or "مستخدم", id=uid, bal=bal, date=user[7] if user else "—")
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown")
 
 # ==================== SETTINGS ====================
 
-@bot.message_handler(func=lambda m: m.text == "⚙️ الإعدادات")
+@bot.message_handler(func=lambda m: m.text and m.text.startswith("⚙️"))
 def settings(msg):
-    bot.send_message(
-        msg.chat.id,
-        "⚙️ *الإعدادات*\n\n"
-        "🔜 تغيير اللغة — قريباً\n"
-        "🔜 الإشعارات — قريباً",
-        parse_mode="Markdown",
-        reply_markup=main_menu()
-    )
+    lang = get_user_language(msg.from_user.id)
+    
+    text = get_text(lang, "settings_title")
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown", reply_markup=settings_menu(lang))
 
+@bot.callback_query_handler(func=lambda c: c.data == "settings_lang")
+def settings_lang(call):
+    lang = get_user_language(call.from_user.id)
+    
+    text = get_text(lang, "lang_title")
+    bot.send_message(call.message.chat.id, text, reply_markup=languages_menu(lang))
+    bot.answer_callback_query(call.id)
 
-@bot.message_handler(func=lambda m: m.text == "↩️ رجوع")
+@bot.callback_query_handler(func=lambda c: c.data.startswith("lang_"))
+def set_language(call):
+    new_lang = call.data.split("_")[1]
+    set_user_language(call.from_user.id, new_lang)
+    
+    bot.answer_callback_query(call.id, get_text(new_lang, "lang_changed"), show_alert=True)
+
+# ==================== FOLLOW ====================
+
+@bot.message_handler(func=lambda m: m.text and m.text.startswith("📢"))
+def follow(msg):
+    lang = get_user_language(msg.from_user.id)
+    
+    text = get_text(lang, "follow_title")
+    markup = follow_menu(lang)
+    
+    if not markup.keyboard:
+        bot.send_message(msg.chat.id, "❌ لا توجد روابط متاحة")
+        return
+    
+    bot.send_message(msg.chat.id, text, reply_markup=markup)
+
+# ==================== SUPPORT ====================
+
+@bot.message_handler(func=lambda m: m.text and m.text.startswith("💬"))
+def support(msg):
+    lang = get_user_language(msg.from_user.id)
+    
+    text = get_text(lang, "support_title")
+    bot.send_message(msg.chat.id, text)
+    
+    bot.register_next_step_handler(msg, _handle_support_message)
+
+def _handle_support_message(msg):
+    """معالجة رسالة الدعم"""
+    if not ADMIN_ID:
+        bot.send_message(msg.chat.id, "❌ لا يوجد أدمن متاح")
+        return
+    
+    # إرسال الرسالة للأدمن
+    try:
+        bot.send_message(
+            ADMIN_ID,
+            f"💬 *رسالة دعم جديدة*\n\n"
+            f"👤 من: `{msg.from_user.id}`\n"
+            f"📱 الاسم: {msg.from_user.first_name}\n\n"
+            f"الرسالة:\n{msg.text}",
+            parse_mode="Markdown",
+            reply_markup=types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton("الرد", callback_data=f"reply_{msg.from_user.id}")
+            )
+        )
+        bot.send_message(msg.chat.id, "✅ تم إرسال رسالتك للدعم. سيتم الرد عليك قريباً.")
+    except Exception as e:
+        bot.send_message(msg.chat.id, f"❌ خطأ: {e}")
+
+# ==================== BACK ====================
+
+@bot.message_handler(func=lambda m: m.text and m.text.startswith("↩️"))
 def back(msg):
-    bot.send_message(msg.chat.id, "🏠 الرئيسية", reply_markup=main_menu())
-
+    lang = get_user_language(msg.from_user.id)
+    bot.send_message(msg.chat.id, get_text(lang, "main_menu"), reply_markup=main_menu(lang))
 
 # ==================== CUSTOM BUTTONS ====================
 
 @bot.message_handler(func=lambda m: True)
-def handle_custom_buttons(msg):
+def handle_custom(msg):
+    """معالجة الأزرار المخصصة"""
     if is_banned(msg.from_user.id):
         return
+    
     for btn in get_custom_buttons():
-        if msg.text == btn["name"]:
-            if btn["type"] == "text":
-                bot.send_message(msg.chat.id, btn["content"])
-            elif btn["type"] == "url":
+        if msg.text == btn[1]:
+            if btn[2] == "text":
+                bot.send_message(msg.chat.id, btn[3])
+            elif btn[2] == "url":
                 markup = types.InlineKeyboardMarkup()
-                markup.add(types.InlineKeyboardButton(btn["name"], url=btn["content"]))
-                bot.send_message(msg.chat.id, f"🔗 {btn['name']}", reply_markup=markup)
+                markup.add(types.InlineKeyboardButton(btn[1], url=btn[3]))
+                bot.send_message(msg.chat.id, f"🔗 {btn[1]}", reply_markup=markup)
             return
-
 
 # ==================== MAIN ====================
 
 if __name__ == "__main__":
-    # تسجيل معالجات الأدمن
+    # استيراد معالجات الأدمن
+    from admin import register_admin_handlers
     register_admin_handlers(bot)
-
-    # تشغيل مراقب الإيداع التلقائي
-    start_deposit_monitor(bot)
-
+    
     bot.remove_webhook()
-    print("✅ البوت شغال! 🚀")
-    print(f"🌐 يراقب شبكة TRON مباشرة")
-    print(f"💼 محفظة الإيداع: {os.getenv('WALLET_ADDRESS', 'غير محددة')}")
+    print("✅ البوت يعمل! 🚀")
+    print(f"👑 أدمن ID: {ADMIN_ID}")
+    print(f"💼 المحفظة: {os.getenv('WALLET_ADDRESS', 'غير محددة')}")
+    
     bot.infinity_polling(none_stop=True, timeout=60)
