@@ -542,7 +542,7 @@ def profile(msg):
     user = get_user(uid)
     bal = get_balance(uid)
     
-    text = get_text(lang, "profile_info", name=msg.from_user.first_name or "مستخدم", id=uid, bal=bal, date=user[7] if user else "—")
+    text = get_text(lang, "profile_info", name=msg.from_user.first_name or "مستخدم", id=uid, bal=bal, date="—")
     bot.send_message(msg.chat.id, text, parse_mode="Markdown")
 
 # ==================== SETTINGS ====================
